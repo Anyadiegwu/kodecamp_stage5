@@ -1,0 +1,28 @@
+# python-multipart
+# dotenv
+# chromadb
+# sentence_transformers
+# PyPDF2
+# python-docx
+
+
+# rank_bm25
+
+
+# langchain-community 
+# langchain_text_splitters 
+# langchain_community 
+# chromadb 
+# langchain_huggingface
+# sentence-transformers
+
+langchain
+langchain-openai
+langchain-community
+langchain_huggingface
+langchain-chroma
+chromadb
+pypdf
+sentence-transformers
+python-dotenv
+rank-bm25
