@@ -1,266 +1,292 @@
 import os
 import sys
 import json
-import warnings
-from pathlib import Path
-from datetime import datetime
+import argparse
 from typing import List
+from pathlib import Path
 from dotenv import load_dotenv
 
-warnings.filterwarnings("ignore")
-
-from langchain.agents import create_agent
-from langchain_core.tools import tool
-from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langchain.agents import create_agent
 from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_chroma import Chroma
 from langchain_community.retrievers import BM25Retriever
-from langchain_classic.retrievers import EnsembleRetriever
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import (
     TextLoader,
     PyPDFLoader,
     CSVLoader,
+    Docx2txtLoader,
+    UnstructuredPowerPointLoader,
 )
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.chat_message_histories import ChatMessageHistory
 
 
 load_dotenv()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-HF_API_KEY = os.getenv("HF_API_KEY", "")
-DATA_DIR = Path("./data")
-CHROMA_DIR = Path("./chroma_db")
-
-DATA_DIR.mkdir(exist_ok=True)
+def format_docs(docs: List[Document]) -> str:
+    return "\n\n".join(doc.page_content for doc in docs)
 
 
-class RAGAgent:
+class ConversationMemoryStore:
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
+        self.documents: List[Document] = []
+        self.store = None
+
+    def _rebuild_store(self):
+        if self.documents:
+            self.store = Chroma.from_documents(
+                self.documents,
+                self.embeddings,
+                collection_name="conversation_memory",
+            )
+
+    def add(self, question: str, answer: str):
+        doc = Document(
+            page_content=f"User: {question}\nAssistant: {answer}"
+        )
+        self.documents.append(doc)
+        self._rebuild_store()
+
+    def search(self, query: str, k: int = 3) -> List[Document]:
+        if not self.store:
+            return []
+        retriever = self.store.as_retriever(search_kwargs={"k": k})
+        return retriever.invoke(query)
+
+class RAGSystem:
     def __init__(self):
-
-        print("\nInitializing Hybrid RAG Agent...\n")
-
         self.embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2"
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            model_kwargs={'device': 'cpu'}, 
+            encode_kwargs={'normalize_embeddings': True}
         )
 
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200,
+        self.splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
         )
 
-        self.documents = self._load_documents()
-        self.vector_store = self._init_chroma(self.documents)
-        self.retriever = self._init_hybrid_retriever()
+        self.documents: List[Document] = []
+        self.vector_store = None
+        self.bm25 = None
+        self.retriever = None
+        self.memory = ConversationMemoryStore(self.embeddings)
 
-        self.llm = ChatOpenAI(
-            model="nvidia/nemotron-3-nano-30b-a3b:free",
-            api_key=OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1",
-            temperature=0.3,
-        )
+    def load_data_dir(self, folder="data"):
+        path = Path(folder)
 
-        self.memory = ChatMessageHistory()
+        if not path.exists():
+            print(f"⚠ '{folder}' folder not found. Creating it...")
+            path.mkdir(exist_ok=True)
+            return
 
-        self.tools = self._create_tools()
+        supported = {".txt", ".pdf", ".csv", ".docx", ".pptx"}
 
-        self.agent = create_agent(self.llm, self.tools)
-        print("Agent ready.\n")
-
-    # ---------- DOCUMENT LOADING ----------
-    def _load_documents(self) -> List[Document]:
-        docs = []
-        for file in DATA_DIR.rglob("*"):
-            if not file.is_file():
+        for file in path.iterdir():
+            if file.suffix.lower() not in supported:
                 continue
-            try:
-                if file.suffix == ".pdf":
-                    loader = PyPDFLoader(str(file))
-                elif file.suffix == ".csv":
-                    loader = CSVLoader(str(file))
-                elif file.suffix in [".txt", ".md"]:
-                    loader = TextLoader(str(file))
-                else:
-                    continue
 
-                loaded = loader.load()
-                docs.extend(loaded)
-                print(f"Loaded: {file.name}")
+            if file.suffix == ".txt":
+                loader = TextLoader(str(file), encoding="utf-8")
+            elif file.suffix == ".pdf":
+                loader = PyPDFLoader(str(file))
+            elif file.suffix == ".csv":
+                loader = CSVLoader(str(file))
+            elif file.suffix == ".docx":
+                loader = Docx2txtLoader(str(file))
+            else:
+                loader = UnstructuredPowerPointLoader(str(file))
 
-            except Exception as e:
-                print(f"Error loading {file.name}: {e}")
+            docs = self.splitter.split_documents(loader.load())
+            self.documents.extend(docs)
 
-        if docs:
-            docs = self.text_splitter.split_documents(docs)
+        print(f"✓ Indexed {len(self.documents)} document chunks")
 
-        return docs
+    def build_retriever(self):
+        if not self.documents:
+            print("⚠ No documents loaded.")
+            return
 
-
-    def _init_chroma(self, docs: List[Document]):
-        store = Chroma(
-            collection_name="rag_collection",
-            embedding_function=self.embeddings,
-            persist_directory=str(CHROMA_DIR),
+        self.vector_store = Chroma.from_documents(
+            self.documents,
+            self.embeddings,
+            collection_name="rag_documents",
         )
 
-        if docs:
-            store.add_documents(docs)
-            print(f"Indexed {len(docs)} document chunks.")
+        self.bm25 = BM25Retriever.from_documents(self.documents, k=5)
 
-        return store
-
-    def _init_hybrid_retriever(self):
-
-        dense_retriever = self.vector_store.as_retriever(search_kwargs={"k": 5})
-
-        bm25_retriever = BM25Retriever.from_documents(
-            self.documents if self.documents else [Document(page_content="")]
+        vector_retriever = self.vector_store.as_retriever(
+            search_kwargs={"k": 2}
         )
-        bm25_retriever.k = 5
 
-        hybrid = EnsembleRetriever(
-            retrievers=[dense_retriever, bm25_retriever],
+        self.retriever = EnsembleRetriever(
+            retrievers=[self.bm25, vector_retriever],
             weights=[0.5, 0.5],
         )
 
-        return hybrid
 
-    def _store_message(self, role: str, content: str):
+    def create_tools(self):
 
-        doc = Document(
-            page_content=content,
-            metadata={
-                "type": "conversation",
-                "role": role,
-                "timestamp": datetime.utcnow().isoformat(),
-            },
-        )
-
-        self.vector_store.add_documents([doc])
-
-    def _create_tools(self):
         @tool
         def rag_query(query: str) -> str:
             """Search internal documents and past conversations."""
-            results = self.retriever.invoke(query)  
+            docs = self.retriever.invoke(query) if self.retriever else []
+            history = self.memory.search(query)
 
-            if not results:
+            combined = docs + history
+
+            if not combined:
                 return "No relevant information found."
 
             return "\n\n".join(
                 f"[Source {i+1}]\n{doc.page_content}"
-                for i, doc in enumerate(results)
+                for i, doc in enumerate(combined)
             )
 
         @tool
         def get_flight_booking(origin: str, destination: str) -> str:
-            """Get flight booking information including schedule, duration, and pricing in USD for a round trip. 
-            Input: origin (departure city) and destination (arrival city) separated by comma, e.g., 'Lagos, Nairobi'."""
+            """Get round-trip flight booking details."""
             flights = {
-                'lagos-nairobi': {
-                    'outbound': {
-                        'departure': '2026-02-15T08:00:00',
-                        'arrival': '2026-02-15T13:30:00',
-                        'duration': '5h 30m',
-                        'price': 450,
-                        'airline': 'Kenya Airways',
-                        'flightNumber': 'KQ512'
+                "lagos-nairobi": {
+                    "outbound": {
+                        "departure": "2026-02-15T08:00:00",
+                        "arrival": "2026-02-15T13:30:00",
+                        "duration": "5h 30m",
+                        "price": 450,
+                        "airline": "Kenya Airways",
+                        "flightNumber": "KQ512",
                     },
-                    'return': {
-                        'departure': '2026-02-18T15:00:00',
-                        'arrival': '2026-02-18T20:30:00',
-                        'duration': '5h 30m',
-                        'price': 450,
-                        'airline': 'Kenya Airways',
-                        'flightNumber': 'KQ513'
+                    "return": {
+                        "departure": "2026-02-18T15:00:00",
+                        "arrival": "2026-02-18T20:30:00",
+                        "duration": "5h 30m",
+                        "price": 450,
+                        "airline": "Kenya Airways",
+                        "flightNumber": "KQ513",
                     },
-                    'totalFlightTime': '11h 0m',
-                    'totalPrice': 900,
-                    'currency': 'USD'
+                    "totalPrice": 900,
+                    "currency": "USD",
                 }
             }
-            
+
             key = f"{origin.lower()}-{destination.lower()}"
-            result = flights.get(key, {'error': 'Route not found'})
-            return json.dumps(result, indent=2)
+            return json.dumps(
+                flights.get(key, {"error": "Route not found"}),
+                indent=2,
+            )
 
         @tool
         def get_hotel_booking(location: str, nights: int) -> str:
-            """Get hotel booking information including pricing in USD per night and total cost. 
-            Input: location (city) and nights (number) separated by comma, e.g., 'Nairobi, 3'."""
+            """Get hotel booking information."""
             hotels = {
-                'nairobi': {
-                    'name': 'Nairobi Serena Hotel',
-                    'pricePerNight': 180,
-                    'totalNights': nights,
-                    'totalPrice': 180 * nights,
-                    'currency': 'USD',
-                    'amenities': ['WiFi', 'Breakfast', 'Conference facilities']
+                "nairobi": {
+                    "name": "Nairobi Serena Hotel",
+                    "pricePerNight": 180,
+                    "totalNights": nights,
+                    "totalPrice": 180 * nights,
+                    "currency": "USD",
                 }
             }
-            
-            result = hotels.get(location.lower(), {'error': 'Location not found'})
-            return json.dumps(result, indent=2)
+
+            return json.dumps(
+                hotels.get(location.lower(), {"error": "Location not found"}),
+                indent=2,
+            )
 
         @tool
-        def convert_currency(amount: float, from_currency: str, to_currency: str) -> str:
-            """Convert an amount from one currency to another. 
-            Input: amount, from_currency, to_currency separated by commas, e.g., '900, USD, NGN'."""
+        def convert_currency(
+            amount: float,
+            from_currency: str,
+            to_currency: str,
+        ) -> str:
+            """Convert currency."""
             rates = {
-                'USD': {'USD': 1, 'NGN': 1550, 'KES': 160, 'EUR': 0.92, 'GBP': 0.79},
-                'NGN': {'USD': 0.00065, 'NGN': 1, 'KES': 0.103, 'EUR': 0.0006, 'GBP': 0.00051},
-                'KES': {'USD': 0.00625, 'NGN': 9.69, 'KES': 1, 'EUR': 0.0058, 'GBP': 0.0049}
+                "USD": {"USD": 1, "NGN": 1550, "KES": 160},
+                "NGN": {"USD": 0.00065, "NGN": 1, "KES": 0.103},
+                "KES": {"USD": 0.00625, "NGN": 9.69, "KES": 1},
             }
-            
-            rate = rates.get(from_currency.upper(), {}).get(to_currency.upper(), 1)
-            converted_amount = amount * rate
-            
+
+            rate = rates.get(from_currency.upper(), {}).get(
+                to_currency.upper(),
+                1,
+            )
+
+            converted = amount * rate
+
             result = {
-                'originalAmount': amount,
-                'originalCurrency': from_currency.upper(),
-                'convertedAmount': round(converted_amount, 2),
-                'targetCurrency': to_currency.upper(),
-                'exchangeRate': rate
+                "originalAmount": amount,
+                "convertedAmount": round(converted, 2),
+                "exchangeRate": rate,
+                "targetCurrency": to_currency.upper(),
             }
+
             return json.dumps(result, indent=2)
-        
 
-        return [get_flight_booking, get_hotel_booking, convert_currency, rag_query]
-
-    def run(self, query: str):
-
-        self.memory.add_user_message(query)
-        self._store_message("user", query)
-
-        result = self.agent.invoke(
-            {"messages": self.memory.messages}
-        )
-
-        output = result["messages"][-1].content
-        self.memory.add_ai_message(output)
-        self._store_message("assistant", output)
-
-        print("\n--- Conversation History ---\n")
-        for msg in self.memory.messages:
-            role = "User" if msg.type == "human" else "Assistant"
-            print(f"{role}: {msg.content}\n")
-
-        print("\n--- Final Response ---\n")
-        print(output)
-
-
-def main():
-
-    if len(sys.argv) < 2:
-        print('Usage: python main.py "your question"')
-        sys.exit(1)
-
-    query = " ".join(sys.argv[1:])
-
-    agent = RAGAgent()
-    agent.run(query)
+        return [
+            rag_query,
+            get_flight_booking,
+            get_hotel_booking,
+            convert_currency,
+        ]
 
 
 if __name__ == "__main__":
-    main()
+
+    parser = argparse.ArgumentParser(
+        description="Hybrid RAG Agent CLI"
+    )
+    parser.add_argument(
+        "prompt",
+        nargs="+",
+        help="Query to send to the agent",
+    )
+    args = parser.parse_args()
+    user_query = " ".join(args.prompt)
+
+    print("\n=== Initializing System ===\n")
+
+    rag = RAGSystem()
+    rag.load_data_dir("data")
+    rag.build_retriever()
+
+    tools = rag.create_tools()
+
+    llm = ChatOpenAI(
+        model="nvidia/nemotron-3-nano-30b-a3b:free",
+        api_key=OPENROUTER_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
+        temperature=0,
+    )
+
+    agent_prompt = """You are a helpful travel assistant with document search and booking tools.
+    Use RAG tool for document questions, booking tools for flights/hotels, currency tool for conversions.
+    Always check documents first if relevant. Respond concisely with JSON when possible."""
+
+    agent = create_agent(
+        llm,
+        tools,
+        system_prompt=agent_prompt,
+    )
+
+    print("\n=== Running Query ===\n")
+    print("Q:", user_query)
+
+    result = agent.invoke({
+        "messages": [
+            ("user", user_query)
+    ]
+    })
+
+    rag.memory.add(user_query, result["messages"][-1].content)
+
+    print("\n=== Agent Response ===\n")
+    print(result["messages"][-1].content)
+
+    print("\n=== Retrieved Memory ===\n")
+    history = rag.memory.search(user_query)
+    print(format_docs(history))
